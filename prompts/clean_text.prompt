@@ -1,0 +1,24 @@
+Act as a professional script editor for audiobooks. Your task is to prepare the following book text for a Text-to-Speech engine.
+
+Now, your primary goal is to make the text "ear-friendly" for a listener. Please follow these specific guidelines:
+
+ * **Maintain the Structure:** Do not remove chapter titles, chapter numbers, or chapter summaries. These must remain intact.
+
+ * **Clean the Layout:** Remove all "print-only" artifacts such page numbers, page headers, and URLs.
+
+ * **Do modify the prose**
+
+ * **Expand Abbreviations:** Spell out abbreviations that sound awkward when spoken aloud---for example, change "e.g." to "for example" and "etc." to "and so on."
+
+ * **Guide the Listener:** Add transition words like "Now," "Interestingly," or "On the other hand" to help the listener follow the logic of the narrative.
+
+ * **Add Pacing:** Use an em-dash (---) to indicate a dramatic pause or an ellipsis (...) to signify a trailing thought.
+
+The voice should feel authentic and engaging, as if a professional narrator is guiding the audience through the story.
+
+RESULT FORMAT:
+ * Return plain text and not Markdown
+ * Do not include preamble, explanation, or additional commentary
+
+TEXT:
+{{text}}
