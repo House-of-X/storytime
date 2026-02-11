@@ -10,10 +10,15 @@ import soundfile as sf
 import boto3
 import pymupdf4llm
 import chevron
+import fitz
 from pathlib import Path
 from kokoro import KPipeline
 from pydub import AudioSegment
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.lib.units import inch
 from pedalboard import (
     Pedalboard, 
     Compressor, 
@@ -26,6 +31,276 @@ from pedalboard import (
     PeakFilter
 )
 from pedalboard.io import AudioFile
+
+
+class PDFImageExtractor:
+    """Extracts images from PDF documents using PyMuPDF."""
+    
+    def extract_images(self, input_pdf, output_dir):
+        """
+        Extracts all embedded images from a PDF file with layout information.
+        
+        Process:
+        - Opens PDF document with PyMuPDF (fitz)
+        - Iterates through each page to find embedded images
+        - Extracts image binary data using xref (cross-reference) identifiers
+        - Captures bounding box coordinates for layout preservation
+        - Saves images to disk with page and index numbering
+        - Returns list of extracted image metadata including position and dimensions
+        
+        Args:
+            input_pdf: Path to source PDF file
+            output_dir: Directory where extracted images will be saved
+            
+        Returns:
+            List of dicts containing page number, file path, bbox, and caption
+        """
+        doc = fitz.open(input_pdf)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+        extracted_images = []
+
+        for page_number in range(len(doc)):
+            page = doc[page_number]
+            # get_images(full=True) returns complete image metadata including xref
+            image_list = page.get_images(full=True)
+
+            for img_index, img in enumerate(image_list):
+                # xref is the cross-reference identifier for the image object
+                xref = img[0]
+                # Extract raw image data and metadata from PDF structure
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                image_ext = base_image["ext"]  # Original format (png, jpg, etc.)
+                image_filename = output_dir / f"page_{page_number+1}_img_{img_index}.{image_ext}"
+
+                with open(image_filename, "wb") as f:
+                    f.write(image_bytes)
+
+                # Get image bounding box for layout preservation
+                img_rects = page.get_image_rects(xref)
+                bbox = img_rects[0] if img_rects else None
+                
+                # Extract caption text near image (within 50 points below)
+                caption = self._extract_caption_near_image(page, bbox) if bbox else ""
+
+                extracted_images.append({
+                    "page": page_number + 1,
+                    "path": image_filename,
+                    "bbox": bbox,
+                    "caption": caption
+                })
+
+        return extracted_images
+    
+    def _extract_caption_near_image(self, page, bbox):
+        """
+        Extracts text near an image that likely represents a caption.
+        
+        Strategy:
+        - Searches for text within 50 points below the image bounding box
+        - Looks for common caption patterns (Figure X.X, Fig X, etc.)
+        - Returns the first matching text block or empty string
+        
+        Args:
+            page: PyMuPDF page object
+            bbox: Image bounding box (x0, y0, x1, y1)
+            
+        Returns:
+            Caption text or empty string
+        """
+        if not bbox:
+            return ""
+        
+        # Define search area below image (50 points)
+        search_rect = fitz.Rect(bbox.x0, bbox.y1, bbox.x1, bbox.y1 + 50)
+        text_blocks = page.get_text("blocks", clip=search_rect)
+        
+        # Look for caption patterns
+        for block in text_blocks:
+            text = block[4].strip()
+            # Match common caption patterns
+            if re.match(r'^(Figure|Fig|Table|Diagram)\s+\d', text, re.IGNORECASE):
+                return text
+        
+        return ""
+
+
+class PDFTableExtractor:
+    """Extracts tables from PDF documents using PyMuPDF's built-in table detection."""
+    
+    def extract_tables(self, input_pdf):
+        """
+        Detects and extracts tables from PDF pages with layout information.
+        
+        Process:
+        - Uses PyMuPDF's find_tables() method for automatic table detection
+        - Converts detected tables to pandas DataFrames for easy manipulation
+        - Preserves table structure including headers and cell data
+        - Captures bounding box coordinates for layout preservation
+        - Extracts caption text near tables
+        - Returns list of table metadata with page numbers, DataFrames, and captions
+        
+        Note: PyMuPDF's table detection uses heuristics to identify table structures
+        based on text alignment, spacing, and visual separators.
+        
+        Args:
+            input_pdf: Path to source PDF file
+            
+        Returns:
+            List of dicts containing page number, table index, DataFrame, bbox, and caption
+        """
+        doc = fitz.open(input_pdf)
+        tables = []
+
+        for page_number in range(len(doc)):
+            page = doc[page_number]
+            # find_tables() returns TableFinder object with detected tables
+            table_finder = page.find_tables()
+
+            for table_index, table in enumerate(table_finder.tables):
+                # Convert table to pandas DataFrame for structured data handling
+                df = table.to_pandas()
+                # Get table bounding box for layout preservation
+                bbox = table.bbox
+                # Extract caption text near table
+                caption = self._extract_caption_near_table(page, bbox)
+                
+                tables.append({
+                    "page": page_number + 1,
+                    "table_index": table_index,
+                    "dataframe": df,
+                    "bbox": bbox,
+                    "caption": caption
+                })
+
+        return tables
+    
+    def _extract_caption_near_table(self, page, bbox):
+        """
+        Extracts text near a table that likely represents a caption.
+        
+        Strategy:
+        - Searches for text within 50 points above and below the table bounding box
+        - Looks for common caption patterns (Table X.X, etc.)
+        - Returns the first matching text block or empty string
+        
+        Args:
+            page: PyMuPDF page object
+            bbox: Table bounding box (x0, y0, x1, y1)
+            
+        Returns:
+            Caption text or empty string
+        """
+        if not bbox:
+            return ""
+        
+        # Search above table (50 points)
+        search_rect_above = fitz.Rect(bbox[0], bbox[1] - 50, bbox[2], bbox[1])
+        text_blocks_above = page.get_text("blocks", clip=search_rect_above)
+        
+        # Search below table (50 points)
+        search_rect_below = fitz.Rect(bbox[0], bbox[3], bbox[2], bbox[3] + 50)
+        text_blocks_below = page.get_text("blocks", clip=search_rect_below)
+        
+        # Check above first, then below
+        for block in text_blocks_above + text_blocks_below:
+            text = block[4].strip()
+            # Match common caption patterns
+            if re.match(r'^(Table|Tab)\s+\d', text, re.IGNORECASE):
+                return text
+        
+        return ""
+
+
+class SupplementaryPDFGenerator:
+    """Generates formatted PDF documents containing extracted images and tables with layout preservation."""
+    
+    def create_pdf(self, images, tables, output_file):
+        """
+        Creates a supplementary PDF with all extracted visual content preserving original layout.
+        
+        Process:
+        - Uses ReportLab's Platypus framework for document layout
+        - Adds title page with "Supplementary Material" heading
+        - Inserts images with captions and page references
+        - Formats tables with captions and grid borders for readability
+        - Preserves original ordering based on page number and position
+        - Builds final PDF with proper spacing and structure
+        
+        Layout strategy:
+        - Images: Sized proportionally to original dimensions (max 6 inches width)
+        - Tables: Auto-sized with black grid borders
+        - Captions: Displayed above or below content as appropriate
+        - Spacing: 0.2-0.5 inch between elements for visual clarity
+        
+        Args:
+            images: List of image metadata dicts (page, path, bbox, caption)
+            tables: List of table metadata dicts (page, table_index, dataframe, bbox, caption)
+            output_file: Path where supplementary PDF will be saved
+        """
+        doc = SimpleDocTemplate(str(output_file))
+        elements = []
+        styles = getSampleStyleSheet()
+
+        # Title page
+        elements.append(Paragraph("Supplementary Material", styles["Heading1"]))
+        elements.append(Spacer(1, 0.3 * inch))
+
+        # Combine images and tables, sort by page number and vertical position
+        all_content = []
+        for img in images:
+            all_content.append({"type": "image", "data": img, "page": img["page"], "y_pos": img["bbox"].y0 if img["bbox"] else 0})
+        for tbl in tables:
+            all_content.append({"type": "table", "data": tbl, "page": tbl["page"], "y_pos": tbl["bbox"][1] if tbl["bbox"] else 0})
+        
+        # Sort by page number, then by vertical position to preserve layout
+        all_content.sort(key=lambda x: (x["page"], x["y_pos"]))
+
+        # Add all content in original layout order
+        for item in all_content:
+            if item["type"] == "image":
+                img = item["data"]
+                # Add caption if available
+                if img["caption"]:
+                    elements.append(Paragraph(img["caption"], styles["Heading2"]))
+                else:
+                    elements.append(Paragraph(f"Image from Page {img['page']}", styles["Heading2"]))
+                elements.append(Spacer(1, 0.2 * inch))
+                
+                # Calculate proportional sizing (max 6 inches width)
+                try:
+                    from PIL import Image as PILImage
+                    pil_img = PILImage.open(img["path"])
+                    aspect_ratio = pil_img.height / pil_img.width
+                    img_width = min(6 * inch, pil_img.width)
+                    img_height = img_width * aspect_ratio
+                    elements.append(Image(str(img["path"]), width=img_width, height=img_height))
+                except:
+                    # Fallback to fixed sizing if PIL fails
+                    elements.append(Image(str(img["path"]), width=4*inch, height=3*inch))
+                elements.append(Spacer(1, 0.5 * inch))
+            
+            elif item["type"] == "table":
+                tbl = item["data"]
+                # Add caption if available
+                if tbl["caption"]:
+                    elements.append(Paragraph(tbl["caption"], styles["Heading2"]))
+                else:
+                    elements.append(Paragraph(f"Table from Page {tbl['page']}", styles["Heading2"]))
+                elements.append(Spacer(1, 0.2 * inch))
+                
+                df = tbl["dataframe"]
+                # Convert DataFrame to list format for ReportLab Table
+                data = [df.columns.tolist()] + df.values.tolist()
+                table = Table(data)
+                # Apply grid style for clear cell boundaries
+                table.setStyle([('GRID', (0,0), (-1,-1), 1, colors.black)])
+                elements.append(table)
+                elements.append(Spacer(1, 0.5 * inch))
+
+        # Build final PDF document
+        doc.build(elements)
 
 
 class AudiobookConfig:
@@ -569,7 +844,7 @@ class AudioPostProcessor:
     def process_audio(self, input_path, output_path):
         """
         Applies the signal chain to the raw audio file and exports the final processed version.
-        Returns the path to the processed audio file.
+        Returns dictionary containing audio metadata (duration, file size, format info).
         """
         print("--- Applying Audio Engineering (Pedalboard) ---")
         
@@ -585,7 +860,28 @@ class AudioPostProcessor:
         with AudioFile(str(output_path), 'w', sample_rate, processed_audio.shape[0]) as f:
             f.write(processed_audio)
         
-        return output_path
+        # Calculate audio metadata
+        duration_seconds = processed_audio.shape[1] / sample_rate
+        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        
+        metadata = {
+            "duration_seconds": duration_seconds,
+            "duration_formatted": self._format_duration(duration_seconds),
+            "file_size_mb": file_size_mb,
+            "sample_rate": sample_rate,
+            "channels": processed_audio.shape[0],
+            "bit_depth": 16,
+            "format": "MP3"
+        }
+        
+        return metadata
+    
+    def _format_duration(self, seconds):
+        """Formats duration in seconds to HH:MM:SS format."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 class AudiobookPipeline:
@@ -661,6 +957,18 @@ class AudiobookPipeline:
         # Save intermediate artifacts if requested.
         self._save_artifacts(markdown_text, llm_cleaned_text, text_chunks)
         
+        # Extract images and tables, create supplementary PDF.
+        # This creates a separate document containing all visual content from the source PDF.
+        image_extractor = PDFImageExtractor()
+        table_extractor = PDFTableExtractor()
+        pdf_generator = SupplementaryPDFGenerator()
+        
+        images = image_extractor.extract_images(self.args.filename, self.config.temp_dir / "images")
+        tables = table_extractor.extract_tables(self.args.filename)
+        supplementary_output = self.config.output_dir / "supplementary_material.pdf"
+        pdf_generator.create_pdf(images, tables, supplementary_output)
+        print(f"Supplementary PDF saved to: {supplementary_output}")
+        
         # Generate raw audio from text chunks.
         audio_generator = AudioGenerator(self.tts_pipeline, self.hybrid_voice, self.config, self.voice_blender)
         full_audio = audio_generator.generate_audio(text_chunks)
@@ -674,7 +982,18 @@ class AudiobookPipeline:
         # Apply post-processing effects.
         post_processor = AudioPostProcessor()
         output_file = self.config.output_dir / 'final_audiobook.mp3'
-        post_processor.process_audio(raw_path, output_file)
+        audio_metadata = post_processor.process_audio(raw_path, output_file)
+        
+        # Display audio information
+        print("\n=== AUDIOBOOK GENERATION COMPLETE ===")
+        print(f"Output File: {output_file}")
+        print(f"Duration: {audio_metadata['duration_formatted']} ({audio_metadata['duration_seconds']:.2f} seconds)")
+        print(f"File Size: {audio_metadata['file_size_mb']:.2f} MB")
+        print(f"Sample Rate: {audio_metadata['sample_rate']} Hz")
+        print(f"Channels: {audio_metadata['channels']} (Mono)")
+        print(f"Bit Depth: {audio_metadata['bit_depth']} bit")
+        print(f"Format: {audio_metadata['format']}")
+        print("====================================\n")
         
         # Clean up temporary files unless artifacts are requested.
         if not self.args.keep_artifacts:
@@ -684,8 +1003,6 @@ class AudiobookPipeline:
                 pass
         else:
             print(f"Artifacts retained in: {self.config.temp_dir}")
-        
-        print(f"DONE! File saved to: {output_file}")
 
 
 def parse_arguments():
