@@ -1,24 +1,126 @@
-Act as a professional script editor for audiobooks. Your task is to prepare the following book text for a Text-to-Speech engine.
+Act as a professional audiobook script editor preparing a manuscript for
+Text-to-Speech narration.
 
-Now, your primary goal is to make the text "ear-friendly" for a listener. Please follow these specific guidelines:
+Your task is to convert the provided raw book text into a TTS-ready
+script while preserving the original content with near-perfect fidelity.
 
- * **Maintain the Structure:** Do not remove chapter titles, chapter numbers, or chapter summaries. These must remain intact.
+## CRITICAL RULES
 
- * **Clean the Layout:** Remove all "print-only" artifacts such page numbers, page headers, and URLs.
+### 1. ZERO CONTENT LOSS POLICY
 
- * **Do modify the prose**
+- You MUST preserve every single word of the original text.
+- You MUST NOT remove, summarize, rewrite, paraphrase, or improve
+    sentences.
+- You MUST NOT modify meaning.
+- You MUST NOT invent or hallucinate missing content.
+- If text appears missing or corrupted, reconstruct it ONLY from the provided raw text. Never invent content.
+- If something cannot be reconstructed from the raw text, leave it exactly as-is.
 
- * **Expand Abbreviations:** Spell out abbreviations that sound awkward when spoken aloud---for example, change "e.g." to "for example" and "etc." to "and so on."
+### 2. STRUCTURE MUST REMAIN EXACT
 
- * **Guide the Listener:** Add transition words like "Now," "Interestingly," or "On the other hand" to help the listener follow the logic of the narrative.
+You MUST preserve:
+- Chapter numbers and titles
+- Section numbers (e.g., "1.1 Curse of the LLMs and the idea of RAG")
+- Subsection numbers (e.g., "1.1.1 LLMs are not trained for facts")
+- Bullet points
+- Ordered lists
+- Paragraph ordering
+- Summary sections
 
- * **Add Pacing:** Use an em-dash (---) to indicate a dramatic pause or an ellipsis (...) to signify a trailing thought.
+Do NOT reorder anything. Do NOT collapse sections. Do NOT combine
+paragraphs.
 
-The voice should feel authentic and engaging, as if a professional narrator is guiding the audience through the story.
+### 3. CLEAN ONLY PRINT ARTIFACTS
 
-RESULT FORMAT:
- * Return plain text and not Markdown
- * Do not include preamble, explanation, or additional commentary
+You MAY remove:
+- Page numbers
+- Running headers
+- URLs
+- Layout fragments
+- Page break markers
+- Decorative formatting artifacts
+
+You MUST NOT remove:
+- Meaningful sentences
+- Section labels
+- Figure numbers
+- Any technical explanation
+
+### 4. FIGURE HANDLING (STRICT FORMAT)
+
+When a figure is referenced (e.g., "Figure 1.1" or "see figure 1.1"):
+- Keep the original reference text unchanged.
+- Immediately after the sentence containing the figure reference, add:
+    "Please refer to figure X.X in the supplementary document."
+- Do NOT describe the image.
+- Do NOT fabricate figure captions.
+- Do NOT invent sources.
+- Do NOT create footnotes for figures.
+
+Example:
+
+Original: (see figure 1.1)
+
+Output: See figure 1.1 in the supplementary document.
+
+### 5. FOOTNOTE POLICY (EXTREMELY IMPORTANT)
+
+- Only process footnotes that are explicitly present in the raw text.
+- Do NOT invent footnotes.
+- Do NOT generate screenshot footnotes.
+- Do NOT create citations.
+- If a footnote marker appears, read it inline as:
+    Foot note 1, followed by the exact footnote content.
+- Insert the footnote immediately where the marker appears.
+- Do NOT move footnotes to the end.
+- If a footnote contains only a URL, remove the URL but preserve the footnote wording.
+
+If a footnote is NOT present in the raw text, DO NOT create one.
+
+### 6. ABBREVIATION EXPANSION RULES
+
+You MAY expand:
+- e.g. → for example
+- etc. → and so on
+- i.e. → that is
+
+Do NOT:
+- Expand technical terminology
+- Change model names
+- Modify product names
+- Alter capitalization
+- Spell out LLM unless necessary for pronunciation clarity
+
+Minimal smoothing is allowed ONLY if it does not change wording.
+
+### 7. NO HALLUCINATIONS POLICY
+
+You MUST NOT:
+- Invent missing paragraphs
+- Create new explanations
+- Insert additional transitions
+- Add commentary
+- Add editorial clarification
+- Modify statistics
+- Add citations not present in the raw text
+
+### 8. OUTPUT RULES
+
+- Output ONLY the cleaned manuscript.
+- Do NOT include commentary.
+- Do NOT explain what you did.
+- Do NOT say "Here is the cleaned version."
+- The first word of your output must be the first word of the actual
+    book text.
+- The last word must be the last word of the provided text.
+- No extra commentary before or after.
+
+### 9. STRICT OUTPUT RULE
+
+- Output ONLY the cleaned book content.
+- Do NOT generate any introductory sentence, or explanations, or phrases such as “Here is the text prepared…”
+- Do NOT include commentary before or after the content.
+- The first word of your response must be the first word of the actual book content (for example, the chapter title).
 
 TEXT:
 {{text}}
