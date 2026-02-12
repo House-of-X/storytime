@@ -1,306 +1,31 @@
 import os
 import sys
+import time
 import argparse
 import re
-import json
 import random
 import numpy as np
 import torch
-import soundfile as sf
-import boto3
-import pymupdf4llm
-import chevron
-import fitz
+import ebooklib
+from ebooklib import epub
+from bs4 import BeautifulSoup
+from markdownify import markdownify as md
+from markdown import markdown
 from pathlib import Path
 from kokoro import KPipeline
 from pydub import AudioSegment
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
-from reportlab.lib.units import inch
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pedalboard import (
     Pedalboard, 
     Compressor, 
     Reverb, 
     Limiter, 
-    Gain, 
     Distortion, 
     HighShelfFilter, 
     LowShelfFilter,
     PeakFilter
 )
 from pedalboard.io import AudioFile
-
-
-class PDFImageExtractor:
-    """Extracts images from PDF documents using PyMuPDF."""
-    
-    def extract_images(self, input_pdf, output_dir):
-        """
-        Extracts all embedded images from a PDF file with layout information.
-        
-        Process:
-        - Opens PDF document with PyMuPDF (fitz)
-        - Iterates through each page to find embedded images
-        - Extracts image binary data using xref (cross-reference) identifiers
-        - Captures bounding box coordinates for layout preservation
-        - Saves images to disk with page and index numbering
-        - Returns list of extracted image metadata including position and dimensions
-        
-        Args:
-            input_pdf: Path to source PDF file
-            output_dir: Directory where extracted images will be saved
-            
-        Returns:
-            List of dicts containing page number, file path, bbox, and caption
-        """
-        doc = fitz.open(input_pdf)
-        output_dir = Path(output_dir)
-        output_dir.mkdir(exist_ok=True)
-        extracted_images = []
-
-        for page_number in range(len(doc)):
-            page = doc[page_number]
-            # get_images(full=True) returns complete image metadata including xref
-            image_list = page.get_images(full=True)
-
-            for img_index, img in enumerate(image_list):
-                # xref is the cross-reference identifier for the image object
-                xref = img[0]
-                # Extract raw image data and metadata from PDF structure
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                image_ext = base_image["ext"]  # Original format (png, jpg, etc.)
-                image_filename = output_dir / f"page_{page_number+1}_img_{img_index}.{image_ext}"
-
-                with open(image_filename, "wb") as f:
-                    f.write(image_bytes)
-
-                # Get image bounding box for layout preservation
-                img_rects = page.get_image_rects(xref)
-                bbox = img_rects[0] if img_rects else None
-                
-                # Extract caption text near image (within 50 points below)
-                caption = self._extract_caption_near_image(page, bbox) if bbox else ""
-
-                extracted_images.append({
-                    "page": page_number + 1,
-                    "path": image_filename,
-                    "bbox": bbox,
-                    "caption": caption
-                })
-
-        return extracted_images
-    
-    def _extract_caption_near_image(self, page, bbox):
-        """
-        Extracts text near an image that likely represents a caption.
-        
-        Strategy:
-        - Searches for text within 50 points below the image bounding box
-        - Looks for common caption patterns (Figure X.X, Fig X, etc.)
-        - Returns the first matching text block or empty string
-        
-        Args:
-            page: PyMuPDF page object
-            bbox: Image bounding box (x0, y0, x1, y1)
-            
-        Returns:
-            Caption text or empty string
-        """
-        if not bbox:
-            return ""
-        
-        # Define search area below image (50 points)
-        search_rect = fitz.Rect(bbox.x0, bbox.y1, bbox.x1, bbox.y1 + 50)
-        text_blocks = page.get_text("blocks", clip=search_rect)
-        
-        # Look for caption patterns
-        for block in text_blocks:
-            text = block[4].strip()
-            # Match common caption patterns
-            if re.match(r'^(Figure|Fig|Table|Diagram)\s+\d', text, re.IGNORECASE):
-                return text
-        
-        return ""
-
-
-class PDFTableExtractor:
-    """Extracts tables from PDF documents using PyMuPDF's built-in table detection."""
-    
-    def extract_tables(self, input_pdf):
-        """
-        Detects and extracts tables from PDF pages with layout information.
-        
-        Process:
-        - Uses PyMuPDF's find_tables() method for automatic table detection
-        - Converts detected tables to pandas DataFrames for easy manipulation
-        - Preserves table structure including headers and cell data
-        - Captures bounding box coordinates for layout preservation
-        - Extracts caption text near tables
-        - Returns list of table metadata with page numbers, DataFrames, and captions
-        
-        Note: PyMuPDF's table detection uses heuristics to identify table structures
-        based on text alignment, spacing, and visual separators.
-        
-        Args:
-            input_pdf: Path to source PDF file
-            
-        Returns:
-            List of dicts containing page number, table index, DataFrame, bbox, and caption
-        """
-        doc = fitz.open(input_pdf)
-        tables = []
-
-        for page_number in range(len(doc)):
-            page = doc[page_number]
-            # find_tables() returns TableFinder object with detected tables
-            table_finder = page.find_tables()
-
-            for table_index, table in enumerate(table_finder.tables):
-                # Convert table to pandas DataFrame for structured data handling
-                df = table.to_pandas()
-                # Get table bounding box for layout preservation
-                bbox = table.bbox
-                # Extract caption text near table
-                caption = self._extract_caption_near_table(page, bbox)
-                
-                tables.append({
-                    "page": page_number + 1,
-                    "table_index": table_index,
-                    "dataframe": df,
-                    "bbox": bbox,
-                    "caption": caption
-                })
-
-        return tables
-    
-    def _extract_caption_near_table(self, page, bbox):
-        """
-        Extracts text near a table that likely represents a caption.
-        
-        Strategy:
-        - Searches for text within 50 points above and below the table bounding box
-        - Looks for common caption patterns (Table X.X, etc.)
-        - Returns the first matching text block or empty string
-        
-        Args:
-            page: PyMuPDF page object
-            bbox: Table bounding box (x0, y0, x1, y1)
-            
-        Returns:
-            Caption text or empty string
-        """
-        if not bbox:
-            return ""
-        
-        # Search above table (50 points)
-        search_rect_above = fitz.Rect(bbox[0], bbox[1] - 50, bbox[2], bbox[1])
-        text_blocks_above = page.get_text("blocks", clip=search_rect_above)
-        
-        # Search below table (50 points)
-        search_rect_below = fitz.Rect(bbox[0], bbox[3], bbox[2], bbox[3] + 50)
-        text_blocks_below = page.get_text("blocks", clip=search_rect_below)
-        
-        # Check above first, then below
-        for block in text_blocks_above + text_blocks_below:
-            text = block[4].strip()
-            # Match common caption patterns
-            if re.match(r'^(Table|Tab)\s+\d', text, re.IGNORECASE):
-                return text
-        
-        return ""
-
-
-class SupplementaryPDFGenerator:
-    """Generates formatted PDF documents containing extracted images and tables with layout preservation."""
-    
-    def create_pdf(self, images, tables, output_file):
-        """
-        Creates a supplementary PDF with all extracted visual content preserving original layout.
-        
-        Process:
-        - Uses ReportLab's Platypus framework for document layout
-        - Adds title page with "Supplementary Material" heading
-        - Inserts images with captions and page references
-        - Formats tables with captions and grid borders for readability
-        - Preserves original ordering based on page number and position
-        - Builds final PDF with proper spacing and structure
-        
-        Layout strategy:
-        - Images: Sized proportionally to original dimensions (max 6 inches width)
-        - Tables: Auto-sized with black grid borders
-        - Captions: Displayed above or below content as appropriate
-        - Spacing: 0.2-0.5 inch between elements for visual clarity
-        
-        Args:
-            images: List of image metadata dicts (page, path, bbox, caption)
-            tables: List of table metadata dicts (page, table_index, dataframe, bbox, caption)
-            output_file: Path where supplementary PDF will be saved
-        """
-        doc = SimpleDocTemplate(str(output_file))
-        elements = []
-        styles = getSampleStyleSheet()
-
-        # Title page
-        elements.append(Paragraph("Supplementary Material", styles["Heading1"]))
-        elements.append(Spacer(1, 0.3 * inch))
-
-        # Combine images and tables, sort by page number and vertical position
-        all_content = []
-        for img in images:
-            all_content.append({"type": "image", "data": img, "page": img["page"], "y_pos": img["bbox"].y0 if img["bbox"] else 0})
-        for tbl in tables:
-            all_content.append({"type": "table", "data": tbl, "page": tbl["page"], "y_pos": tbl["bbox"][1] if tbl["bbox"] else 0})
-        
-        # Sort by page number, then by vertical position to preserve layout
-        all_content.sort(key=lambda x: (x["page"], x["y_pos"]))
-
-        # Add all content in original layout order
-        for item in all_content:
-            if item["type"] == "image":
-                img = item["data"]
-                # Add caption if available
-                if img["caption"]:
-                    elements.append(Paragraph(img["caption"], styles["Heading2"]))
-                else:
-                    elements.append(Paragraph(f"Image from Page {img['page']}", styles["Heading2"]))
-                elements.append(Spacer(1, 0.2 * inch))
-                
-                # Calculate proportional sizing (max 6 inches width)
-                try:
-                    from PIL import Image as PILImage
-                    pil_img = PILImage.open(img["path"])
-                    aspect_ratio = pil_img.height / pil_img.width
-                    img_width = min(6 * inch, pil_img.width)
-                    img_height = img_width * aspect_ratio
-                    elements.append(Image(str(img["path"]), width=img_width, height=img_height))
-                except:
-                    # Fallback to fixed sizing if PIL fails
-                    elements.append(Image(str(img["path"]), width=4*inch, height=3*inch))
-                elements.append(Spacer(1, 0.5 * inch))
-            
-            elif item["type"] == "table":
-                tbl = item["data"]
-                # Add caption if available
-                if tbl["caption"]:
-                    elements.append(Paragraph(tbl["caption"], styles["Heading2"]))
-                else:
-                    elements.append(Paragraph(f"Table from Page {tbl['page']}", styles["Heading2"]))
-                elements.append(Spacer(1, 0.2 * inch))
-                
-                df = tbl["dataframe"]
-                # Convert DataFrame to list format for ReportLab Table
-                data = [df.columns.tolist()] + df.values.tolist()
-                table = Table(data)
-                # Apply grid style for clear cell boundaries
-                table.setStyle([('GRID', (0,0), (-1,-1), 1, colors.black)])
-                elements.append(table)
-                elements.append(Spacer(1, 0.5 * inch))
-
-        # Build final PDF document
-        doc.build(elements)
 
 
 class AudiobookConfig:
@@ -387,98 +112,154 @@ class VoiceBlender:
 class TextProcessor:
     """Handles text extraction, normalization, and cleaning operations."""
     
-    def __init__(self, bedrock_client=None):
-        self.bedrock_client = bedrock_client
-        self.prompt_template = self._load_prompt_template()
+    def __init__(self):
+        pass
     
-    def _load_prompt_template(self):
-        """Loads the LLM prompt template from file."""
-        template_path = Path('prompts/clean_text.prompt')
-        with open(template_path, 'r', encoding='utf-8') as file:
-            return file.read()
+    def _markdown_to_plaintext(self, text):
+        """Converts markdown to plaintext."""
+        # Remove markdown images and links before conversion
+        text = re.sub(r'!\[([^\]]*)\]\([^\)]+\)', '', text)  # Remove images
+        text = re.sub(r'\[([^\]]*)\]\([^\)]+\)', r'\1', text)  # Convert links to text
+        
+        html = markdown(text, extensions=['extra'])
+        soup = BeautifulSoup(html, 'html.parser')
+
+        return soup.get_text()
+    
+    def _html_to_plaintext(self, html_content):
+        """Converts HTML directly to plaintext."""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        # Remove images, links, and figure captions
+        for tag in soup.find_all(['img', 'figcaption', 'figure']):
+            tag.decompose()
+        
+        return soup.get_text()
     
     def normalize_text(self, text):
-        """
-        Applies basic text normalization to remove formatting artifacts and improve readability.
-        Removes hyphenated line breaks, page numbers, figures, and excessive whitespace.
-        """
-        text = re.sub(r'-\n', '', text)
-        text = re.sub(r'(?<![.!?:])\n(?!\n)', ' ', text)
-        text = re.sub(r'¡\s*', '', text)
-        text = re.sub(r'~~[^~]+~~', '', text)
-        text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)
-        text = re.sub(r'Figure \d+\.\d+[^\n]*', '', text)
-        text = re.sub(r' +', ' ', text)
-        text = re.sub(r'\n{3,}', '\n\n', text)
+        """Applies basic text normalization to remove formatting artifacts."""
         return text.strip()
     
-    def clean_text_with_llm(self, text):
-        """
-        Uses Claude LLM to enhance text for audiobook narration by expanding abbreviations,
-        adding transitions, and removing print-only artifacts while maintaining structure.
-        """
-        if len(text.strip()) < 10:
-            return text
+
+    def _display_toc_and_select(self, book):
+        """Displays EPUB table of contents and prompts user to select chapters."""
+        toc = book.toc
+        chapters = []
         
-        prompt = chevron.render(self.prompt_template, {'text': text})
+        print("\n=== Table of Contents ===")
+        for index, item in enumerate(toc, 1):
+            if isinstance(item, tuple):
+                section = item[0]
+                title = section.title
+                href = section.href.split('#')[0]
+            else:
+                title = item.title
+                href = item.href.split('#')[0]
+            chapters.append((title, href))
+            print(f"{index}. {title}")
         
-        try:
-            response = self.bedrock_client.invoke_model(
-                modelId="anthropic.claude-3-haiku-20240307-v1:0",
-                body=json.dumps({
-                    "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": len(text) + 200,
-                    "temperature": 0.3,
-                    "messages": [{"role": "user", "content": prompt}]
-                })
-            )
-            result = json.loads(response["body"].read())
-            cleaned = result["content"][0]["text"].strip()
-            return cleaned if len(cleaned) > len(text) * 0.2 else text
-        except Exception as e:
-            print(f"LLM Error: {e}. Using raw text.")
-            return text
+        print("\nEnter chapter range (e.g., '1' for chapter 1, '1-5' for chapters 1-5, or 'all'):")
+        user_input = input("> ").strip().lower()
+        
+        if user_input == 'all':
+            return [href for _, href in chapters]
+        elif '-' in user_input:
+            start, end = user_input.split('-')
+            start_index = int(start) - 1
+            end_index = int(end)
+            return [href for _, href in chapters[start_index:end_index]]
+        else:
+            index = int(user_input) - 1
+            return [chapters[index][1]]
     
-    def extract_and_chunk_pdf(self, filename, start_page, end_page, use_language_model=True):
-        """
-        Extracts text from PDF, splits into manageable chunks, and optionally cleans with LLM.
-        Returns a list of processed text chunks ready for audio generation.
-        """
-        print(f"--- Extracting PDF: {filename} ---")
+    def _process_chapter(self, chapter_content, batch_num=0, is_html=False):
+        """Processes a whole chapter through normalization and chunking."""
+        # Convert to plaintext
+        if is_html:
+            plaintext = self._html_to_plaintext(chapter_content)
+        else:
+            # Remove XML declaration
+            chapter_content = re.sub(r"xml version=['\"].*?['\"]\s*encoding=['\"].*?['\"]\?", '', chapter_content)
+            # Remove code blocks and inline code
+            chapter_content = re.sub(r'```[\s\S]*?```', '', chapter_content)
+            chapter_content = re.sub(r'`[^`]+`', '', chapter_content)
+            plaintext = self._markdown_to_plaintext(chapter_content)
         
-        # Extract markdown from PDF using specified page range.
-        markdown_text = pymupdf4llm.to_markdown(
-            filename,
-            pages=list(range(start_page - 1, end_page)) if end_page else None
-        )
+        # Normalize the plaintext
+        normalized = self.normalize_text(plaintext)
         
-        # Remove code blocks and inline code that shouldn't be narrated.
-        markdown_text = re.sub(r'```[\s\S]*?```', '', markdown_text)
-        markdown_text = re.sub(r'`[^`]+`', '', markdown_text)
-        
-        # Split by markdown headers to preserve document structure.
-        header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[('#', 'h1'), ('##', 'h2')])
-        header_splits = header_splitter.split_text(markdown_text)
-        
-        # Further split into smaller chunks for better TTS processing.
-        final_chunks = []
-        llm_cleaned_sections = []
-        text_splitter = RecursiveCharacterTextSplitter(
+        # Split into smaller chunks for TTS processing
+        tts_splitter = RecursiveCharacterTextSplitter(
             chunk_size=650, chunk_overlap=0, separators=["\n\n", ". ", "! ", "? ", "; "]
         )
+        chunks = tts_splitter.split_text(normalized)
         
-        print("--- Processing Text Chunks ---")
-        for document in header_splits:
-            normalized = self.normalize_text(document.page_content)
-            if use_language_model and self.bedrock_client:
-                cleaned = self.clean_text_with_llm(normalized)
+        return normalized, chunks
+    
+    def extract_and_chunk_epub(self, filename, start_chapter, end_chapter):
+        """Extracts text from EPUB and processes directly from HTML."""
+        print(f"--- Extracting EPUB: {filename} ---")
+        
+        book = epub.read_epub(filename)
+        toc = book.toc
+        chapter_list = []
+        
+        for item in toc:
+            if isinstance(item, tuple):
+                section = item[0]
+                title = section.title
+                href = section.href.split('#')[0]
             else:
-                cleaned = normalized
-            llm_cleaned_sections.append(cleaned)
-            final_chunks.extend(text_splitter.split_text(cleaned))
+                title = item.title
+                href = item.href.split('#')[0]
+            chapter_list.append((title, href))
         
-        llm_cleaned_text = '\n\n'.join(llm_cleaned_sections)
-        return markdown_text, llm_cleaned_text, final_chunks
+        # Handle index-based chapter selection
+        if start_chapter is not None or end_chapter is not None:
+            start_index = int(start_chapter) if start_chapter else 0
+            end_index = int(end_chapter) + 1 if end_chapter else len(chapter_list)
+            
+            if start_index < 0 or start_index >= len(chapter_list):
+                print(f"Error: Invalid start chapter index {start_index}. Valid range: 0-{len(chapter_list)-1}")
+                sys.exit(1)
+            if end_index <= start_index or end_index > len(chapter_list):
+                print(f"Error: Invalid end chapter index {end_chapter}. Valid range: {start_index}-{len(chapter_list)-1}")
+                sys.exit(1)
+            
+            selected_chapters = chapter_list[start_index:end_index]
+            chapter_hrefs = [href for _, href in selected_chapters]
+        else:
+            chapter_hrefs = self._display_toc_and_select(book)
+        
+        chapters = []
+        chapter_titles = []
+        for item in book.get_items():
+            if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                item_name = item.get_name()
+                if any(href in item_name for href in chapter_hrefs):
+                    html_content = item.get_content().decode('utf-8', errors='ignore')
+                    chapters.append(html_content)
+                    for title, href in chapter_list:
+                        if href in item_name:
+                            chapter_titles.append(title)
+                            break
+        
+        # Process each chapter from HTML
+        processed_sections = []
+        chapter_chunks = []
+        
+        for index, chapter_html in enumerate(chapters):
+            print(f"Processing chapter {index+1}/{len(chapters)}...")
+            processed, chunks = self._process_chapter(chapter_html, index, is_html=True)
+            processed_sections.append(processed)
+            chapter_chunks.append(chunks)
+        
+        # Convert to markdown for raw output only
+        markdown_chapters = [md(html, heading_style='ATX', strip=['xml']) for html in chapters]
+        markdown_text = '\n\n'.join(markdown_chapters)
+        processed_text = '\n\n'.join(processed_sections)
+        return markdown_text, processed_text, chapter_chunks, chapter_titles
+    
+
 
 
 class AudioGenerator:
@@ -506,7 +287,10 @@ class AudioGenerator:
         - Each breath instance will be slightly modified to avoid identical waveform reuse.
         """
         try:
-            breath_file = 'templates/male-inhale.mp3' if self.config.voice_type == 'male' else 'templates/female-inhale.mp3'
+            if self.config.voice_type == 'male':
+                breath_file = 'templates/male-inhale.mp3'
+            else:
+                breath_file = 'templates/female-inhale.mp3'
             breath = AudioSegment.from_mp3(breath_file)
             breath = breath.set_frame_rate(self.config.sample_rate)
             return breath
@@ -566,7 +350,7 @@ class AudioGenerator:
         
         Ultra-human mimicry breath modeling:
         - Breaths are context-aware, not probability-based.
-        - Insert breath when sentence length exceeds 22 words (natural respiratory need).
+        - Insert breath when sentence length exceeds 18 words (natural respiratory need).
         - Insert after emotionally intense punctuation (! or ?) as humans naturally
           pause and breathe after expressing strong emotion.
         - Insert before dialogue segments to mimic the natural breath actors take
@@ -579,7 +363,7 @@ class AudioGenerator:
         word_count = len(chunk_text.split())
         
         # Context-aware breath triggers.
-        is_long_sentence = word_count > 22
+        is_long_sentence = word_count > 18
         
         # Breath is needed for long sentences or emotional/dialogue contexts.
         return is_long_sentence or has_emotional_punctuation or is_dialogue
@@ -659,6 +443,7 @@ class AudioGenerator:
         print(f"--- Generating Audio ({len(text_chunks)} chunks) ---")
         
         audio_segments = []
+        previous_chunk = ""
         
         # Temporarily override the pipeline's voice loading to use our hybrid voice.
         original_load_voice = self.pipeline.load_voice
@@ -671,8 +456,21 @@ class AudioGenerator:
             # Detect emotional context for dynamic adjustments.
             emotional_context = self._detect_emotional_context(chunk_text)
             
+            # Add breath at paragraph start
+            is_paragraph_start = i == 0 or previous_chunk.endswith('\n\n') or '\n\n' in previous_chunk[-10:]
+            
+            if is_paragraph_start and self.breath_sample:
+                pre_silence = random.randint(150, 250)
+                post_silence = random.randint(100, 180)
+                
+                audio_segments.append(AudioSegment.silent(duration=pre_silence, frame_rate=self.config.sample_rate))
+                varied_breath = self._get_varied_breath()
+                if varied_breath:
+                    audio_segments.append(varied_breath)
+                audio_segments.append(AudioSegment.silent(duration=post_silence, frame_rate=self.config.sample_rate))
+            
             # Context-aware breath insertion.
-            if self._should_add_breath(
+            elif self._should_add_breath(
                 chunk_text,
                 emotional_context['has_emotional_punctuation'],
                 emotional_context['is_dialogue']
@@ -746,6 +544,8 @@ class AudioGenerator:
             # Add contextual pause after chunk with prosodic timing variability.
             pause_milliseconds = self._calculate_pause_duration(chunk_text)
             audio_segments.append(AudioSegment.silent(duration=pause_milliseconds, frame_rate=self.config.sample_rate))
+            
+            previous_chunk = chunk_text
             
             if i % 5 == 0:
                 print(f"Generated {i}/{len(text_chunks)} chunks...")
@@ -897,11 +697,11 @@ class AudiobookPipeline:
         print("--- Initializing Models ---")
         
         # Determine compute device.
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if torch.cuda.is_available():
+            self.device = 'cuda'
+        else:
+            self.device = 'cpu'
         print(f"Using device: {self.device}")
-        
-        # Initialize AWS Bedrock client for LLM processing.
-        self.bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
         
         # Initialize Kokoro TTS pipeline.
         self.tts_pipeline = KPipeline(lang_code='a', device=self.device)
@@ -919,24 +719,21 @@ class AudiobookPipeline:
         # Store voice blender for use in audio generation.
         self.voice_blender = voice_blender
     
-    def _save_artifacts(self, markdown_text, llm_cleaned_text, text_chunks):
+    def _save_artifacts(self, markdown_text, processed_text, text_chunks):
         """Saves intermediate processing artifacts if requested by user."""
         if not self.args.keep_artifacts:
             return
         
-        # Save raw PDF extract.
         raw_output_path = self.config.temp_dir / 'raw.md'
         with open(raw_output_path, 'w', encoding='utf-8') as file:
             file.write(markdown_text)
-        print(f"Saved raw PDF extract to: {raw_output_path}")
+        print(f"Saved raw extract to: {raw_output_path}")
         
-        # Save LLM-cleaned text.
-        llm_output_path = self.config.temp_dir / 'cleaned.txt'
-        with open(llm_output_path, 'w', encoding='utf-8') as file:
-            file.write(llm_cleaned_text)
-        print(f"Saved LLM-cleaned text to: {llm_output_path}")
+        processed_output_path = self.config.temp_dir / 'processed.txt'
+        with open(processed_output_path, 'w', encoding='utf-8') as file:
+            file.write(processed_text)
+        print(f"Saved processed text to: {processed_output_path}")
         
-        # Save chunked text.
         chunks_output_path = self.config.temp_dir / 'chunks.txt'
         with open(chunks_output_path, 'w', encoding='utf-8') as file:
             for index, chunk in enumerate(text_chunks):
@@ -944,83 +741,102 @@ class AudiobookPipeline:
         print(f"Saved processed chunks to: {chunks_output_path}")
     
     def run(self):
-        """Executes the complete audiobook generation pipeline from PDF to final audio."""
-        # Extract and process text from PDF.
-        text_processor = TextProcessor(self.bedrock_client if not self.args.no_llm else None)
-        markdown_text, llm_cleaned_text, text_chunks = text_processor.extract_and_chunk_pdf(
+        """Executes the complete audiobook generation pipeline from EPUB to final audio."""
+        text_processor = TextProcessor()
+        
+        markdown_text, processed_text, chapter_chunks, chapter_titles = text_processor.extract_and_chunk_epub(
             self.args.filename,
-            self.args.start_page,
-            self.args.end_page,
-            use_language_model=not self.args.no_llm
+            self.args.start_chapter,
+            self.args.end_chapter
         )
         
-        # Save intermediate artifacts if requested.
-        self._save_artifacts(markdown_text, llm_cleaned_text, text_chunks)
+        all_chunks = [chunk for chunks in chapter_chunks for chunk in chunks]
+        self._save_artifacts(markdown_text, processed_text, all_chunks)
         
-        # Extract images and tables, create supplementary PDF.
-        # This creates a separate document containing all visual content from the source PDF.
-        image_extractor = PDFImageExtractor()
-        table_extractor = PDFTableExtractor()
-        pdf_generator = SupplementaryPDFGenerator()
-        
-        images = image_extractor.extract_images(self.args.filename, self.config.temp_dir / "images")
-        tables = table_extractor.extract_tables(self.args.filename)
-        supplementary_output = self.config.output_dir / "supplementary_material.pdf"
-        pdf_generator.create_pdf(images, tables, supplementary_output)
-        print(f"Supplementary PDF saved to: {supplementary_output}")
-        
-        # Generate raw audio from text chunks.
         audio_generator = AudioGenerator(self.tts_pipeline, self.hybrid_voice, self.config, self.voice_blender)
-        full_audio = audio_generator.generate_audio(text_chunks)
-        
-        # Export raw audio to temporary file.
-        raw_path = self.config.temp_dir / 'raw_speech.wav'
-        full_audio.export(str(raw_path), format='wav')
-        if self.args.keep_artifacts:
-            print(f"Saved raw audio to: {raw_path}")
-        
-        # Apply post-processing effects.
         post_processor = AudioPostProcessor()
-        output_file = self.config.output_dir / 'final_audiobook.mp3'
-        audio_metadata = post_processor.process_audio(raw_path, output_file)
         
-        # Display audio information
+        total_chapters = len(chapter_chunks)
+        start_time = time.time()
+        
+        for index, chunks in enumerate(chapter_chunks):
+            chapter_title = chapter_titles[index] if index < len(chapter_titles) else f"Chapter_{index+1}"
+            kebab_title = re.sub(r'[^\w\s-]', '', chapter_title).strip().lower().replace(' ', '-')
+            safe_title = f"{index}-{kebab_title}"
+            
+            print(f"\n--- Generating audio for: {chapter_title} ---")
+            chapter_audio = audio_generator.generate_audio(chunks)
+            
+            raw_path = self.config.temp_dir / f'{safe_title}_raw.wav'
+            chapter_audio.export(str(raw_path), format='wav')
+            
+            output_file = self.config.output_dir / f'{safe_title}.mp3'
+            audio_metadata = post_processor.process_audio(raw_path, output_file)
+            
+            elapsed = time.time() - start_time
+            avg_time_per_chapter = elapsed / (index + 1)
+            remaining_chapters = total_chapters - (index + 1)
+            estimated_remaining = avg_time_per_chapter * remaining_chapters
+            
+            elapsed_str = self._format_duration(elapsed)
+            remaining_str = self._format_duration(estimated_remaining)
+            
+            print(f"Saved: {output_file} ({audio_metadata['duration_formatted']}, {audio_metadata['file_size_mb']:.2f} MB)")
+            print(f"Progress: {index + 1}/{total_chapters} chapters | Elapsed: {elapsed_str} | Remaining: {remaining_str}")
+            
+            if not self.args.keep_artifacts:
+                try:
+                    os.remove(raw_path)
+                except:
+                    pass
+        
         print("\n=== AUDIOBOOK GENERATION COMPLETE ===")
-        print(f"Output File: {output_file}")
-        print(f"Duration: {audio_metadata['duration_formatted']} ({audio_metadata['duration_seconds']:.2f} seconds)")
-        print(f"File Size: {audio_metadata['file_size_mb']:.2f} MB")
-        print(f"Sample Rate: {audio_metadata['sample_rate']} Hz")
-        print(f"Channels: {audio_metadata['channels']} (Mono)")
-        print(f"Bit Depth: {audio_metadata['bit_depth']} bit")
-        print(f"Format: {audio_metadata['format']}")
-        print("====================================\n")
-        
-        # Clean up temporary files unless artifacts are requested.
-        if not self.args.keep_artifacts:
-            try:
-                os.remove(raw_path)
-            except:
-                pass
-        else:
+        print(f"Generated {len(chapter_chunks)} chapter(s) in: {self.config.output_dir}")
+        if self.args.keep_artifacts:
             print(f"Artifacts retained in: {self.config.temp_dir}")
+    
+    def _format_duration(self, seconds):
+        """Formats duration in seconds to HH:MM:SS format."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def print_toc(filename):
+    """Prints table of contents with indexes."""
+    book = epub.read_epub(filename)
+    toc = book.toc
+    
+    print("\n=== Table of Contents ===")
+    for index, item in enumerate(toc):
+        if isinstance(item, tuple):
+            title = item[0].title
+        else:
+            title = item.title
+        print(f"{index}: {title}")
+    print()
 
 
 def parse_arguments():
     """Parses and validates command-line arguments for the audiobook generator."""
-    parser = argparse.ArgumentParser(description='Process PDF files for text-to-speech with Audio Engineering')
-    parser.add_argument('filename', help='PDF file to process')
+    parser = argparse.ArgumentParser(description='Process EPUB files for text-to-speech with Audio Engineering')
+    parser.add_argument('filename', help='EPUB file to process')
     parser.add_argument('--output-dir', default='output_audio', help='Output directory for generated files')
     parser.add_argument('--voice-type', choices=['male', 'female'], default='female', help='Voice gender for narration')
-    parser.add_argument('--start-page', type=int, default=1, help='Starting page number')
-    parser.add_argument('--end-page', type=int, help='Ending page number')
-    parser.add_argument('--no-llm', action='store_true', help='Skip Claude cleaning (faster, less expensive)')
-    parser.add_argument('--keep-artifacts', action='store_true', help='Retain intermediate files (PDF markdown, LLM output, raw audio)')
+    parser.add_argument('--start-chapter', type=str, help='Starting chapter index')
+    parser.add_argument('--end-chapter', type=str, help='Ending chapter index')
+    parser.add_argument('--keep-artifacts', action='store_true', help='Retain intermediate files (raw markdown, processed text, raw audio)')
+    parser.add_argument('--print-toc', action='store_true', help='Print table of contents with indexes and exit')
     args = parser.parse_args()
     
-    # Validate file format.
-    if not args.filename.lower().endswith('.pdf'):
-        print(f"Error: Unsupported format. Please provide a .pdf file.", file=sys.stderr)
+    if not args.filename.lower().endswith('.epub'):
+        print(f"Error: Unsupported format. Please provide an .epub file.", file=sys.stderr)
         sys.exit(1)
+    
+    if args.print_toc:
+        print_toc(args.filename)
+        sys.exit(0)
     
     return args
 
