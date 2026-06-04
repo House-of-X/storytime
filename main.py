@@ -127,16 +127,55 @@ class TextProcessor:
         return soup.get_text()
     
     def _html_to_plaintext(self, html_content):
-        """Converts HTML directly to plaintext."""
+        """Converts HTML directly to plaintext with clean formatting."""
         soup = BeautifulSoup(html_content, 'html.parser')
-        # Remove images, links, and figure captions
-        for tag in soup.find_all(['img', 'figcaption', 'figure']):
+        # Remove non-text elements
+        for tag in soup.find_all(['img', 'figcaption', 'figure', 'style', 'script']):
             tag.decompose()
         
-        return soup.get_text()
+        # Find leaf block elements (blocks that don't contain other blocks)
+        block_tags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote']
+        blocks = soup.find_all(block_tags)
+        
+        if blocks:
+            paragraphs = []
+            seen = set()
+            for block in blocks:
+                text = re.sub(r'\s+', ' ', block.get_text(separator=' ')).strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    paragraphs.append(text)
+            return '\n\n'.join(paragraphs)
+        
+        # Fallback: collapse whitespace in raw text
+        text = soup.get_text()
+        lines = [re.sub(r'\s+', ' ', line).strip() for line in text.split('\n')]
+        lines = [l for l in lines if l]
+        return '\n\n'.join(lines)
     
+    def _url_to_words(self, match):
+        """Converts a URL into spoken words."""
+        url = match.group(0)
+        replacements = [
+            ('://', ' colon forward slash forward slash '),
+            ('/', ' forward slash '),
+            ('.', ' dot '),
+            ('-', ' dash '),
+            ('_', ' underscore '),
+            ('?', ' question mark '),
+            ('&', ' ampersand '),
+            ('=', ' equals '),
+            ('#', ' hash '),
+            ('@', ' at '),
+            (':', ' colon '),
+        ]
+        for old, new in replacements:
+            url = url.replace(old, new)
+        return url.strip()
+
     def normalize_text(self, text):
         """Applies basic text normalization to remove formatting artifacts."""
+        text = re.sub(r'https?://[^\s)>]+', self._url_to_words, text)
         return text.strip()
     
 
@@ -187,11 +226,16 @@ class TextProcessor:
         # Normalize the plaintext
         normalized = self.normalize_text(plaintext)
         
-        # Split into smaller chunks for TTS processing
+        # Split into smaller chunks for TTS processing.
+        # Prioritize paragraph breaks, then full sentences (ending with punctuation followed by space).
+        # Avoid splitting mid-sentence by using sentence-terminal patterns.
         tts_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=650, chunk_overlap=0, separators=["\n\n", ". ", "! ", "? ", "; "]
+            chunk_size=650, chunk_overlap=0, separators=["\n\n", ".\n", "!\n", "?\n", ". ", "! ", "? ", "; ", ", "],
+            keep_separator="end"
         )
         chunks = tts_splitter.split_text(normalized)
+        # Re-attach trailing separators that belong to the previous chunk
+        chunks = [c.strip() for c in chunks if c.strip()]
         
         return normalized, chunks
     
@@ -827,6 +871,7 @@ def parse_arguments():
     parser.add_argument('--start-chapter', type=str, help='Starting chapter index')
     parser.add_argument('--end-chapter', type=str, help='Ending chapter index')
     parser.add_argument('--keep-artifacts', action='store_true', help='Retain intermediate files (raw markdown, processed text, raw audio)')
+    parser.add_argument('--extract-only', action='store_true', help='Extract text artifacts only, no audio generation')
     parser.add_argument('--print-toc', action='store_true', help='Print table of contents with indexes and exit')
     args = parser.parse_args()
     
@@ -841,9 +886,42 @@ def parse_arguments():
     return args
 
 
+def extract_only(args):
+    """Extracts text artifacts from EPUB without generating audio."""
+    config = AudiobookConfig(args.output_dir, args.voice_type)
+    text_processor = TextProcessor()
+
+    markdown_text, processed_text, chapter_chunks, chapter_titles = text_processor.extract_and_chunk_epub(
+        args.filename, args.start_chapter, args.end_chapter
+    )
+
+    all_chunks = [chunk for chunks in chapter_chunks for chunk in chunks]
+
+    raw_output_path = config.temp_dir / 'raw.md'
+    with open(raw_output_path, 'w', encoding='utf-8') as f:
+        f.write(markdown_text)
+    print(f"Saved raw extract to: {raw_output_path}")
+
+    processed_output_path = config.temp_dir / 'processed.txt'
+    with open(processed_output_path, 'w', encoding='utf-8') as f:
+        f.write(processed_text)
+    print(f"Saved processed text to: {processed_output_path}")
+
+    chunks_output_path = config.temp_dir / 'chunks.txt'
+    with open(chunks_output_path, 'w', encoding='utf-8') as f:
+        for index, chunk in enumerate(all_chunks):
+            f.write(f"--- Chunk {index+1} ---\n{chunk}\n\n")
+    print(f"Saved processed chunks to: {chunks_output_path}")
+
+
 def main():
     """Entry point for the audiobook generation application."""
     args = parse_arguments()
+
+    if args.extract_only:
+        extract_only(args)
+        return
+
     pipeline = AudiobookPipeline(args, args.output_dir, args.voice_type)
     pipeline.run()
 
