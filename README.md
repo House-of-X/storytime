@@ -11,6 +11,12 @@ A text-to-speech audiobook generator that converts EPUB files into high-quality 
 - Interactive chapter selection
 - Index-based chapter range selection
 
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
 ## Usage
 
 ### Basic Command
