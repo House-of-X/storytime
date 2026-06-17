@@ -4,14 +4,20 @@ import time
 import argparse
 import re
 import random
+import logging
+import shutil
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
+import psutil
 import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 from markdown import markdown
 from pathlib import Path
+from tqdm import tqdm
 from kokoro import KPipeline
 from pydub import AudioSegment
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -26,6 +32,51 @@ from pedalboard import (
     PeakFilter
 )
 from pedalboard.io import AudioFile
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger(__name__)
+
+# Suppress noisy third-party warnings
+logging.getLogger('kokoro').setLevel(logging.ERROR)
+logging.getLogger('misaki').setLevel(logging.ERROR)
+
+
+class SystemMonitor:
+    """Reports system health: RAM, disk, and VRAM usage."""
+
+    @staticmethod
+    def get_status(output_dir=None):
+        mem = psutil.virtual_memory()
+        ram_used_gb = mem.used / (1024 ** 3)
+        ram_total_gb = mem.total / (1024 ** 3)
+        ram_pct = mem.percent
+
+        disk_path = str(output_dir) if output_dir else '/'
+        disk = shutil.disk_usage(disk_path)
+        disk_free_gb = disk.free / (1024 ** 3)
+        disk_total_gb = disk.total / (1024 ** 3)
+
+        status = (
+            f"RAM: {ram_used_gb:.1f}/{ram_total_gb:.1f} GB ({ram_pct}%) | "
+            f"Disk free: {disk_free_gb:.1f}/{disk_total_gb:.1f} GB"
+        )
+
+        if torch.cuda.is_available():
+            vram_used = torch.cuda.memory_allocated() / (1024 ** 3)
+            vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            vram_pct = (vram_used / vram_total) * 100 if vram_total > 0 else 0
+            status += f" | VRAM: {vram_used:.1f}/{vram_total:.1f} GB ({vram_pct:.0f}%)"
+
+        return status
+
+    @staticmethod
+    def log_status(output_dir=None):
+        log.info(f"System: {SystemMonitor.get_status(output_dir)}")
 
 
 class AudiobookConfig:
@@ -45,7 +96,7 @@ class AudiobookConfig:
         # Voice blending uses 60/40 ratio as baseline for human realism.
         # This asymmetric blend prevents tonal sameness across long narration.
         # The ratio will be varied slightly per chunk to add organic variation.
-        self.blend_ratio = 0.6
+        self.blend_ratio = 0.7
         self.output_dir = Path(output_directory)
         self.temp_dir = self.output_dir / 'temp'
         self.sample_rate = 24000
@@ -72,7 +123,7 @@ class VoiceBlender:
           vocal inconsistencies in human narration.
         - This prevents ghosting artifacts and crashes during audio generation.
         """
-        print(f"--- Blending Voices: {voice_1_name} ({ratio*100}%) + {voice_2_name} ({(1-ratio)*100}%) ---")
+        log.info(f"Blending voices: {voice_1_name} ({ratio*100:.0f}%) + {voice_2_name} ({(1-ratio)*100:.0f}%)")
         
         try:
             # Load voice tensors from the pipeline's internal cache.
@@ -90,7 +141,7 @@ class VoiceBlender:
                 return (voice_1 * ratio) + (voice_2 * (1 - ratio))
                 
         except Exception as e:
-            print(f"Warning: Could not blend voices automatically ({e}). Using {voice_1_name} only.")
+            log.warning(f"Could not blend voices ({e}). Using {voice_1_name} only.")
             return voice_1_name
     
     def get_dynamic_blend_ratio(self, chunk_index):
@@ -239,60 +290,102 @@ class TextProcessor:
         
         return normalized, chunks
     
+    def extract_and_chunk_markdown(self, filename):
+        """Extracts text from a Markdown file and processes it."""
+        log.info(f"Extracting Markdown: {filename}")
+
+        with open(filename, 'r', encoding='utf-8') as f:
+            markdown_text = f.read()
+
+        # Split by headings to create chapters
+        chapters = re.split(r'(?=^#{1,2}\s)', markdown_text, flags=re.MULTILINE)
+        chapters = [c for c in chapters if c.strip()]
+
+        chapter_titles = []
+        chapter_chunks = []
+        processed_sections = []
+
+        for index, chapter in enumerate(tqdm(chapters, desc="Parsing", unit="sec", leave=False)):
+            title_match = re.match(r'^#{1,2}\s+(.+)', chapter)
+            title = title_match.group(1).strip() if title_match else f"Section_{index+1}"
+            chapter_titles.append(title)
+            processed, chunks = self._process_chapter(chapter, index, is_html=False)
+            processed_sections.append(processed)
+            chapter_chunks.append(chunks)
+
+        processed_text = '\n\n'.join(processed_sections)
+        return markdown_text, processed_text, chapter_chunks, chapter_titles
+
+    def _flatten_toc(self, toc):
+        """Flattens nested TOC into a list of (title, href) leaf entries."""
+        entries = []
+        for item in toc:
+            if isinstance(item, tuple):
+                section, children = item[0], item[1]
+                entries.append((section.title.strip(), section.href.split('#')[0]))
+                entries.extend(self._flatten_toc(children))
+            else:
+                entries.append((item.title.strip(), item.href.split('#')[0]))
+        return entries
+
     def extract_and_chunk_epub(self, filename, start_chapter, end_chapter):
         """Extracts text from EPUB and processes directly from HTML."""
-        print(f"--- Extracting EPUB: {filename} ---")
+        log.info(f"Extracting EPUB: {filename}")
         
         book = epub.read_epub(filename)
         toc = book.toc
+        
+        # Flatten TOC to get every section as its own entry
+        flat_toc = self._flatten_toc(toc)
+        
+        # Deduplicate by href (same xhtml file referenced multiple times)
+        seen = set()
         chapter_list = []
+        for title, href in flat_toc:
+            if href not in seen:
+                seen.add(href)
+                chapter_list.append((title, href))
         
-        for item in toc:
-            if isinstance(item, tuple):
-                section = item[0]
-                title = section.title
-                href = section.href.split('#')[0]
-            else:
-                title = item.title
-                href = item.href.split('#')[0]
-            chapter_list.append((title, href))
-        
-        # Handle index-based chapter selection
+        # Handle chapter selection
         if start_chapter is not None or end_chapter is not None:
             start_index = int(start_chapter) if start_chapter else 0
             end_index = int(end_chapter) + 1 if end_chapter else len(chapter_list)
             
             if start_index < 0 or start_index >= len(chapter_list):
-                print(f"Error: Invalid start chapter index {start_index}. Valid range: 0-{len(chapter_list)-1}")
+                log.error(f"Invalid start chapter index {start_index}. Valid range: 0-{len(chapter_list)-1}")
                 sys.exit(1)
             if end_index <= start_index or end_index > len(chapter_list):
-                print(f"Error: Invalid end chapter index {end_chapter}. Valid range: {start_index}-{len(chapter_list)-1}")
+                log.error(f"Invalid end chapter index {end_chapter}. Valid range: {start_index}-{len(chapter_list)-1}")
                 sys.exit(1)
             
-            selected_chapters = chapter_list[start_index:end_index]
-            chapter_hrefs = [href for _, href in selected_chapters]
+            selected = chapter_list[start_index:end_index]
         else:
-            chapter_hrefs = self._display_toc_and_select(book)
+            selected_hrefs = self._display_toc_and_select(book)
+            selected = [(t, h) for t, h in chapter_list if h in selected_hrefs]
         
-        chapters = []
-        chapter_titles = []
+        # Build href -> html map
+        href_to_html = {}
         for item in book.get_items():
             if item.get_type() == ebooklib.ITEM_DOCUMENT:
                 item_name = item.get_name()
-                if any(href in item_name for href in chapter_hrefs):
-                    html_content = item.get_content().decode('utf-8', errors='ignore')
-                    chapters.append(html_content)
-                    for title, href in chapter_list:
-                        if href in item_name:
-                            chapter_titles.append(title)
-                            break
+                for _, href in selected:
+                    if href in item_name and href not in href_to_html:
+                        href_to_html[href] = item.get_content().decode('utf-8', errors='ignore')
+                        break
+        
+        # Build chapters list
+        chapters = []
+        chapter_titles = []
+        for title, href in selected:
+            if href in href_to_html:
+                chapters.append(href_to_html[href])
+                chapter_titles.append(title)
         
         # Process each chapter from HTML
         processed_sections = []
         chapter_chunks = []
         
-        for index, chapter_html in enumerate(chapters):
-            print(f"Processing chapter {index+1}/{len(chapters)}...")
+        for index, chapter_html in enumerate(tqdm(chapters, desc="Parsing", unit="sec", leave=False)):
             processed, chunks = self._process_chapter(chapter_html, index, is_html=True)
             processed_sections.append(processed)
             chapter_chunks.append(chunks)
@@ -339,7 +432,7 @@ class AudioGenerator:
             breath = breath.set_frame_rate(self.config.sample_rate)
             return breath
         except:
-            print("Warning: Breath sample not found. Skipping breaths.")
+            log.warning("Breath sample not found. Skipping breaths.")
             return None
     
     def _get_varied_breath(self):
@@ -473,131 +566,94 @@ class AudioGenerator:
     def generate_audio(self, text_chunks):
         """
         Generates complete audiobook from text chunks with natural pacing, breaths, and pauses.
-        
-        Ultra-human mimicry implementation:
-        - Dynamic voice blending per chunk (±5% variation from 60/40 baseline)
-        - Micro pitch drift (±0.15 semitones) for warmth
-        - Context-aware breath insertion
-        - Prosodic timing variability
-        - Emotional intensity scaling
-        - Micro-fade stitching to prevent clicks
-        
         Returns a combined AudioSegment ready for post-processing.
         """
-        print(f"--- Generating Audio ({len(text_chunks)} chunks) ---")
-        
         audio_segments = []
         previous_chunk = ""
         
-        # Temporarily override the pipeline's voice loading to use our hybrid voice.
         original_load_voice = self.pipeline.load_voice
         self.pipeline.load_voice = lambda x: self.hybrid_voice
         
-        for i, chunk_text in enumerate(text_chunks):
+        chunk_bar = tqdm(text_chunks, desc="  Chunks", unit="chunk", leave=False, position=1)
+        
+        for i, chunk_text in enumerate(chunk_bar):
             if not chunk_text.strip():
                 continue
             
-            # Detect emotional context for dynamic adjustments.
-            emotional_context = self._detect_emotional_context(chunk_text)
-            
-            # Add breath at paragraph start
-            is_paragraph_start = i == 0 or previous_chunk.endswith('\n\n') or '\n\n' in previous_chunk[-10:]
-            
-            if is_paragraph_start and self.breath_sample:
-                pre_silence = random.randint(150, 250)
-                post_silence = random.randint(100, 180)
+            try:
+                emotional_context = self._detect_emotional_context(chunk_text)
                 
-                audio_segments.append(AudioSegment.silent(duration=pre_silence, frame_rate=self.config.sample_rate))
-                varied_breath = self._get_varied_breath()
-                if varied_breath:
-                    audio_segments.append(varied_breath)
-                audio_segments.append(AudioSegment.silent(duration=post_silence, frame_rate=self.config.sample_rate))
-            
-            # Context-aware breath insertion.
-            elif self._should_add_breath(
-                chunk_text,
-                emotional_context['has_emotional_punctuation'],
-                emotional_context['is_dialogue']
-            ):
-                # Variable pre/post breath silence for natural rhythm.
-                pre_silence = random.randint(100, 200)
-                post_silence = random.randint(80, 150)
+                # Add breath at paragraph start
+                is_paragraph_start = i == 0 or previous_chunk.endswith('\n\n') or '\n\n' in previous_chunk[-10:]
                 
-                audio_segments.append(AudioSegment.silent(duration=pre_silence, frame_rate=self.config.sample_rate))
+                if is_paragraph_start and self.breath_sample:
+                    pre_silence = random.randint(150, 250)
+                    post_silence = random.randint(100, 180)
+                    audio_segments.append(AudioSegment.silent(duration=pre_silence, frame_rate=self.config.sample_rate))
+                    varied_breath = self._get_varied_breath()
+                    if varied_breath:
+                        audio_segments.append(varied_breath)
+                    audio_segments.append(AudioSegment.silent(duration=post_silence, frame_rate=self.config.sample_rate))
+                elif self._should_add_breath(
+                    chunk_text,
+                    emotional_context['has_emotional_punctuation'],
+                    emotional_context['is_dialogue']
+                ):
+                    pre_silence = random.randint(100, 200)
+                    post_silence = random.randint(80, 150)
+                    audio_segments.append(AudioSegment.silent(duration=pre_silence, frame_rate=self.config.sample_rate))
+                    varied_breath = self._get_varied_breath()
+                    if varied_breath:
+                        audio_segments.append(varied_breath)
+                    audio_segments.append(AudioSegment.silent(duration=post_silence, frame_rate=self.config.sample_rate))
                 
-                # Get varied breath instance to avoid identical waveform reuse.
-                varied_breath = self._get_varied_breath()
-                if varied_breath:
-                    audio_segments.append(varied_breath)
-                
-                audio_segments.append(AudioSegment.silent(duration=post_silence, frame_rate=self.config.sample_rate))
-            
-            # Dynamic speed adjustment based on emotional context.
-            # Excitement: slightly faster (0.92-0.98)
-            # Normal: baseline (0.88-0.94)
-            # Serious/ellipsis: slightly slower (0.84-0.90)
-            if emotional_context['has_emotional_punctuation'] and '!' in chunk_text:
-                base_speed = random.uniform(0.92, 0.98)
-            elif emotional_context['has_ellipsis']:
-                base_speed = random.uniform(0.84, 0.90)
-            else:
-                base_speed = random.uniform(0.88, 0.94)
-            
-            current_speed = base_speed + random.uniform(-0.02, 0.02)
-            
-            # Micro pitch drift for human warmth.
-            # Random drift ±0.15 semitones, clamped within ±0.2 semitones total.
-            pitch_drift = random.uniform(-0.15, 0.15)
-            self.pitch_drift_accumulator += pitch_drift
-            self.pitch_drift_accumulator = max(-0.2, min(0.2, self.pitch_drift_accumulator))
-            
-            # Reset pitch drift at paragraph boundaries (chapter-like breaks).
-            if "\n\n" in chunk_text:
-                self.pitch_drift_accumulator = 0.0
-            
-            generator = self.pipeline(chunk_text, voice=self.config.voice_1, speed=current_speed, split_pattern=r'\n+')
-            
-            # Convert generated audio tensors to AudioSegment format.
-            for _, _, audio_tensor in generator:
-                if isinstance(audio_tensor, torch.Tensor):
-                    audio_numpy = audio_tensor.cpu().numpy()
+                if emotional_context['has_emotional_punctuation'] and '!' in chunk_text:
+                    base_speed = random.uniform(0.92, 0.98)
+                elif emotional_context['has_ellipsis']:
+                    base_speed = random.uniform(0.84, 0.90)
                 else:
-                    audio_numpy = audio_tensor
+                    base_speed = random.uniform(0.88, 0.94)
                 
-                # Convert float32 normalized audio (-1.0 to 1.0) to int16 PCM format.
-                # Multiplying by 32767 scales the float range to the int16 range (-32768 to 32767).
-                # This is the standard PCM audio format used by most audio libraries and hardware.
-                audio_int16 = (audio_numpy * 32767).astype(np.int16)
+                current_speed = base_speed + random.uniform(-0.02, 0.02)
                 
-                # Create AudioSegment with mono channel (1) and 16-bit sample width (2 bytes).
-                # Sample rate of 24000 Hz provides good quality for speech while keeping file sizes reasonable.
-                segment = AudioSegment(
-                    audio_int16.tobytes(), 
-                    frame_rate=self.config.sample_rate,
-                    sample_width=2, 
-                    channels=1
-                )
+                pitch_drift = random.uniform(-0.15, 0.15)
+                self.pitch_drift_accumulator += pitch_drift
+                self.pitch_drift_accumulator = max(-0.2, min(0.2, self.pitch_drift_accumulator))
                 
-                # Apply micro-fade stitching (5-8 ms) to prevent clicks and digital transients.
-                # This smooths waveform discontinuities when concatenating audio chunks.
-                fade_duration = random.randint(5, 8)
-                segment = segment.fade_in(fade_duration).fade_out(fade_duration)
+                if "\n\n" in chunk_text:
+                    self.pitch_drift_accumulator = 0.0
                 
-                audio_segments.append(segment)
-            
-            # Add contextual pause after chunk with prosodic timing variability.
-            pause_milliseconds = self._calculate_pause_duration(chunk_text)
-            audio_segments.append(AudioSegment.silent(duration=pause_milliseconds, frame_rate=self.config.sample_rate))
-            
-            previous_chunk = chunk_text
-            
-            if i % 5 == 0:
-                print(f"Generated {i}/{len(text_chunks)} chunks...")
+                generator = self.pipeline(chunk_text, voice=self.config.voice_1, speed=current_speed, split_pattern=r'\n+')
+                
+                for _, _, audio_tensor in generator:
+                    if isinstance(audio_tensor, torch.Tensor):
+                        audio_numpy = audio_tensor.cpu().numpy()
+                    else:
+                        audio_numpy = audio_tensor
+                    
+                    audio_int16 = (audio_numpy * 32767).astype(np.int16)
+                    segment = AudioSegment(
+                        audio_int16.tobytes(), 
+                        frame_rate=self.config.sample_rate,
+                        sample_width=2, 
+                        channels=1
+                    )
+                    fade_duration = random.randint(5, 8)
+                    segment = segment.fade_in(fade_duration).fade_out(fade_duration)
+                    audio_segments.append(segment)
+                
+                pause_milliseconds = self._calculate_pause_duration(chunk_text)
+                audio_segments.append(AudioSegment.silent(duration=pause_milliseconds, frame_rate=self.config.sample_rate))
+                previous_chunk = chunk_text
+                
+            except Exception as e:
+                log.error(f"Failed on chunk {i+1}/{len(text_chunks)}: {e}")
+                log.debug(f"Chunk content: {chunk_text[:100]}...")
+                log.debug(traceback.format_exc())
+                continue
         
-        # Restore original voice loading method.
+        chunk_bar.close()
         self.pipeline.load_voice = original_load_voice
-        
-        # Combine all audio segments into single track.
         return sum(audio_segments)
 
 
@@ -690,7 +746,6 @@ class AudioPostProcessor:
         Applies the signal chain to the raw audio file and exports the final processed version.
         Returns dictionary containing audio metadata (duration, file size, format info).
         """
-        print("--- Applying Audio Engineering (Pedalboard) ---")
         
         # Read raw audio file.
         with AudioFile(str(input_path)) as f:
@@ -738,14 +793,14 @@ class AudiobookPipeline:
     
     def _initialize_models(self):
         """Sets up all required models and services for the pipeline."""
-        print("--- Initializing Models ---")
+        log.info("Initializing models...")
         
         # Determine compute device.
         if torch.cuda.is_available():
             self.device = 'cuda'
         else:
             self.device = 'cpu'
-        print(f"Using device: {self.device}")
+        log.info(f"Using device: {self.device}")
         
         # Initialize Kokoro TTS pipeline.
         self.tts_pipeline = KPipeline(lang_code='a', device=self.device)
@@ -771,75 +826,180 @@ class AudiobookPipeline:
         raw_output_path = self.config.temp_dir / 'raw.md'
         with open(raw_output_path, 'w', encoding='utf-8') as file:
             file.write(markdown_text)
-        print(f"Saved raw extract to: {raw_output_path}")
+        log.info(f"Saved raw extract to: {raw_output_path}")
         
         processed_output_path = self.config.temp_dir / 'processed.txt'
         with open(processed_output_path, 'w', encoding='utf-8') as file:
             file.write(processed_text)
-        print(f"Saved processed text to: {processed_output_path}")
+        log.info(f"Saved processed text to: {processed_output_path}")
         
         chunks_output_path = self.config.temp_dir / 'chunks.txt'
         with open(chunks_output_path, 'w', encoding='utf-8') as file:
             for index, chunk in enumerate(text_chunks):
                 file.write(f"--- Chunk {index+1} ---\n{chunk}\n\n")
-        print(f"Saved processed chunks to: {chunks_output_path}")
+        log.info(f"Saved processed chunks to: {chunks_output_path}")
     
     def run(self):
-        """Executes the complete audiobook generation pipeline from EPUB to final audio."""
+        """Executes the complete audiobook generation pipeline."""
         text_processor = TextProcessor()
         
-        markdown_text, processed_text, chapter_chunks, chapter_titles = text_processor.extract_and_chunk_epub(
-            self.args.filename,
-            self.args.start_chapter,
-            self.args.end_chapter
-        )
+        log.info("Extracting text...")
+        try:
+            if self.args.filename.lower().endswith('.md'):
+                markdown_text, processed_text, chapter_chunks, chapter_titles = text_processor.extract_and_chunk_markdown(
+                    self.args.filename
+                )
+            else:
+                markdown_text, processed_text, chapter_chunks, chapter_titles = text_processor.extract_and_chunk_epub(
+                    self.args.filename,
+                    self.args.start_chapter,
+                    self.args.end_chapter
+                )
+        except Exception as e:
+            log.error(f"Text extraction failed: {e}")
+            log.debug(traceback.format_exc())
+            sys.exit(1)
         
         all_chunks = [chunk for chunks in chapter_chunks for chunk in chunks]
+        total_chunks = len(all_chunks)
         self._save_artifacts(markdown_text, processed_text, all_chunks)
         
         audio_generator = AudioGenerator(self.tts_pipeline, self.hybrid_voice, self.config, self.voice_blender)
         post_processor = AudioPostProcessor()
         
         total_chapters = len(chapter_chunks)
-        start_time = time.time()
+        log.info(f"Starting generation: {total_chapters} sections, {total_chunks} total chunks")
+        SystemMonitor.log_status(self.config.output_dir)
         
-        for index, chunks in enumerate(chapter_chunks):
-            chapter_title = chapter_titles[index] if index < len(chapter_titles) else f"Chapter_{index+1}"
-            kebab_title = re.sub(r'[^\w\s-]', '', chapter_title).strip().lower().replace(' ', '-')
-            safe_title = f"{index}-{kebab_title}"
-            
-            print(f"\n--- Generating audio for: {chapter_title} ---")
-            chapter_audio = audio_generator.generate_audio(chunks)
-            
-            raw_path = self.config.temp_dir / f'{safe_title}_raw.wav'
-            chapter_audio.export(str(raw_path), format='wav')
-            
-            output_file = self.config.output_dir / f'{safe_title}.mp3'
-            audio_metadata = post_processor.process_audio(raw_path, output_file)
-            
-            elapsed = time.time() - start_time
-            avg_time_per_chapter = elapsed / (index + 1)
-            remaining_chapters = total_chapters - (index + 1)
-            estimated_remaining = avg_time_per_chapter * remaining_chapters
-            
-            elapsed_str = self._format_duration(elapsed)
-            remaining_str = self._format_duration(estimated_remaining)
-            
-            print(f"Saved: {output_file} ({audio_metadata['duration_formatted']}, {audio_metadata['file_size_mb']:.2f} MB)")
-            print(f"Progress: {index + 1}/{total_chapters} chapters | Elapsed: {elapsed_str} | Remaining: {remaining_str}")
-            
-            if not self.args.keep_artifacts:
+        # ETA tracking with exponential moving average
+        ema_seconds_per_chunk = None
+        ema_alpha = 0.3
+        chunks_completed = 0
+        pipeline_start = time.time()
+        
+        # CPU worker pool for parallel post-processing while GPU generates next section
+        cpu_workers = min(4, max(1, (psutil.cpu_count(logical=False) or 2) - 1))
+        log.info(f"Post-processing workers: {cpu_workers}")
+        post_futures = []
+        
+        chapter_bar = tqdm(total=total_chapters, desc="Sections", unit="sec", position=0)
+        
+        with ThreadPoolExecutor(max_workers=cpu_workers) as executor:
+            for index, chunks in enumerate(chapter_chunks):
+                chapter_title = chapter_titles[index] if index < len(chapter_titles) else f"Chapter_{index+1}"
+                kebab_title = re.sub(r'[^\w\s-]', '', chapter_title).strip().lower().replace(' ', '-')
+                safe_title = f"{index}-{kebab_title}"
+                
+                chapter_bar.set_postfix_str(f"{chapter_title[:40]}")
+                chapter_start = time.time()
+                
                 try:
-                    os.remove(raw_path)
-                except:
-                    pass
+                    chapter_audio = audio_generator.generate_audio(chunks)
+                    
+                    raw_path = self.config.temp_dir / f'{safe_title}_raw.wav'
+                    chapter_audio.export(str(raw_path), format='wav')
+                    
+                    # Submit post-processing to CPU thread pool
+                    output_file = self.config.output_dir / f'{safe_title}.mp3'
+                    future = executor.submit(
+                        self._post_process_section,
+                        post_processor, raw_path, output_file
+                    )
+                    post_futures.append((future, output_file, len(chunks), chapter_start))
+                    
+                except Exception as e:
+                    log.error(f"Failed to generate '{chapter_title}': {e}")
+                    log.debug(traceback.format_exc())
+                    chunks_completed += len(chunks)
+                
+                # Drain completed futures without blocking
+                still_pending = []
+                for fut, out_file, n_chunks, ch_start in post_futures:
+                    if fut.done():
+                        try:
+                            audio_metadata = fut.result()
+                        except Exception as e:
+                            log.error(f"Post-processing failed for {out_file.name}: {e}")
+                            chapter_bar.update(1)
+                            chunks_completed += n_chunks
+                            continue
+                        
+                        chapter_elapsed = time.time() - ch_start
+                        spc = chapter_elapsed / max(n_chunks, 1)
+                        if ema_seconds_per_chunk is None:
+                            ema_seconds_per_chunk = spc
+                        else:
+                            ema_seconds_per_chunk = ema_alpha * spc + (1 - ema_alpha) * ema_seconds_per_chunk
+                        
+                        chunks_completed += n_chunks
+                        chunks_remaining = total_chunks - chunks_completed
+                        eta_seconds = (ema_seconds_per_chunk or 0) * chunks_remaining
+                        
+                        chapter_bar.update(1)
+                        tqdm.write(
+                            f"  done {out_file.name} | "
+                            f"{audio_metadata['duration_formatted']} | "
+                            f"{audio_metadata['file_size_mb']:.1f} MB | "
+                            f"ETA: {self._format_duration(eta_seconds)}"
+                        )
+                    else:
+                        still_pending.append((fut, out_file, n_chunks, ch_start))
+                post_futures = still_pending
+                
+                # Log system health every 5 sections
+                if (index + 1) % 5 == 0:
+                    SystemMonitor.log_status(self.config.output_dir)
+            
+            # Wait for remaining post-processing futures
+            for fut, out_file, n_chunks, ch_start in post_futures:
+                try:
+                    audio_metadata = fut.result()
+                except Exception as e:
+                    log.error(f"Post-processing failed for {out_file.name}: {e}")
+                    chapter_bar.update(1)
+                    chunks_completed += n_chunks
+                    continue
+                
+                chapter_elapsed = time.time() - ch_start
+                spc = chapter_elapsed / max(n_chunks, 1)
+                if ema_seconds_per_chunk is None:
+                    ema_seconds_per_chunk = spc
+                else:
+                    ema_seconds_per_chunk = ema_alpha * spc + (1 - ema_alpha) * ema_seconds_per_chunk
+                
+                chunks_completed += n_chunks
+                chunks_remaining = total_chunks - chunks_completed
+                eta_seconds = (ema_seconds_per_chunk or 0) * chunks_remaining
+                
+                chapter_bar.update(1)
+                tqdm.write(
+                    f"  done {out_file.name} | "
+                    f"{audio_metadata['duration_formatted']} | "
+                    f"{audio_metadata['file_size_mb']:.1f} MB | "
+                    f"ETA: {self._format_duration(eta_seconds)}"
+                )
         
-        print("\n=== AUDIOBOOK GENERATION COMPLETE ===")
-        print(f"Generated {len(chapter_chunks)} chapter(s) in: {self.config.output_dir}")
+        chapter_bar.close()
+        
+        total_elapsed = time.time() - pipeline_start
+        log.info(f"Complete: {total_chapters} section(s) in {self._format_duration(total_elapsed)}")
+        log.info(f"Output: {self.config.output_dir}")
+        SystemMonitor.log_status(self.config.output_dir)
         if self.args.keep_artifacts:
-            print(f"Artifacts retained in: {self.config.temp_dir}")
+            log.info(f"Artifacts: {self.config.temp_dir}")
     
-    def _format_duration(self, seconds):
+    def _post_process_section(self, post_processor, raw_path, output_file):
+        """Runs pedalboard + MP3 export in a thread pool worker."""
+        audio_metadata = post_processor.process_audio(raw_path, output_file)
+        if not self.args.keep_artifacts:
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
+        return audio_metadata
+    
+    @staticmethod
+    def _format_duration(seconds):
         """Formats duration in seconds to HH:MM:SS format."""
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
@@ -850,14 +1010,19 @@ class AudiobookPipeline:
 def print_toc(filename):
     """Prints table of contents with indexes."""
     book = epub.read_epub(filename)
-    toc = book.toc
+    processor = TextProcessor()
+    flat_toc = processor._flatten_toc(book.toc)
+    
+    # Deduplicate by href
+    seen = set()
+    entries = []
+    for title, href in flat_toc:
+        if href not in seen:
+            seen.add(href)
+            entries.append(title)
     
     print("\n=== Table of Contents ===")
-    for index, item in enumerate(toc):
-        if isinstance(item, tuple):
-            title = item[0].title
-        else:
-            title = item.title
+    for index, title in enumerate(entries):
         print(f"{index}: {title}")
     print()
 
@@ -875,43 +1040,51 @@ def parse_arguments():
     parser.add_argument('--print-toc', action='store_true', help='Print table of contents with indexes and exit')
     args = parser.parse_args()
     
-    if not args.filename.lower().endswith('.epub'):
-        print(f"Error: Unsupported format. Please provide an .epub file.", file=sys.stderr)
+    if not args.filename.lower().endswith(('.epub', '.md')):
+        log.error("Unsupported format. Please provide an .epub or .md file.")
         sys.exit(1)
     
     if args.print_toc:
-        print_toc(args.filename)
+        if args.filename.lower().endswith('.epub'):
+            print_toc(args.filename)
+        else:
+            log.error("--print-toc is only supported for EPUB files.")
         sys.exit(0)
     
     return args
 
 
 def extract_only(args):
-    """Extracts text artifacts from EPUB without generating audio."""
+    """Extracts text artifacts without generating audio."""
     config = AudiobookConfig(args.output_dir, args.voice_type)
     text_processor = TextProcessor()
 
-    markdown_text, processed_text, chapter_chunks, chapter_titles = text_processor.extract_and_chunk_epub(
-        args.filename, args.start_chapter, args.end_chapter
-    )
+    if args.filename.lower().endswith('.md'):
+        markdown_text, processed_text, chapter_chunks, chapter_titles = text_processor.extract_and_chunk_markdown(
+            args.filename
+        )
+    else:
+        markdown_text, processed_text, chapter_chunks, chapter_titles = text_processor.extract_and_chunk_epub(
+            args.filename, args.start_chapter, args.end_chapter
+        )
 
     all_chunks = [chunk for chunks in chapter_chunks for chunk in chunks]
 
     raw_output_path = config.temp_dir / 'raw.md'
     with open(raw_output_path, 'w', encoding='utf-8') as f:
         f.write(markdown_text)
-    print(f"Saved raw extract to: {raw_output_path}")
+    log.info(f"Saved raw extract to: {raw_output_path}")
 
     processed_output_path = config.temp_dir / 'processed.txt'
     with open(processed_output_path, 'w', encoding='utf-8') as f:
         f.write(processed_text)
-    print(f"Saved processed text to: {processed_output_path}")
+    log.info(f"Saved processed text to: {processed_output_path}")
 
     chunks_output_path = config.temp_dir / 'chunks.txt'
     with open(chunks_output_path, 'w', encoding='utf-8') as f:
         for index, chunk in enumerate(all_chunks):
             f.write(f"--- Chunk {index+1} ---\n{chunk}\n\n")
-    print(f"Saved processed chunks to: {chunks_output_path}")
+    log.info(f"Saved processed chunks to: {chunks_output_path}")
 
 
 def main():
