@@ -8,3 +8,5 @@ kokoro
 pydub
 langchain-text-splitters
 pedalboard
+tqdm
+psutil
